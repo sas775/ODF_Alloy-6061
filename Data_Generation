@@ -1,0 +1,266 @@
+# Physics-based ODF -> E, Y, F dataset generator for Al-6061
+
+!pip install --quiet openpyxl
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import itertools
+import math
+import os
+
+# ------------ User parameters (edit if needed) ------------
+N = 150000            # total ODF samples to generate (set smaller to test)
+D = 64                # number of discrete orientation nodes
+alpha_dirichlet = 0.8 # Dirichlet concentration (>=0.1; lower => sparser)
+batch_size = 3000     # number of samples processed per batch (tune by RAM)
+save_excel = True     # save .xlsx (can be slow for very large N)
+save_to_drive = False # set True to save to Google Drive (requires mount)
+drive_folder = "/content/drive/MyDrive/ODF_dataset"  # if drive saving enabled
+
+# Material constants (Aluminum single-crystal, approximate)
+# Source: typical FCC aluminium single-crystal constants (Pa)
+C11 = 106e9
+C12 = 60e9
+C44 = 28e9
+
+# Target mean macroscopic yield for Al-6061 (Pa).
+target_mean_Y = 276e6  # ~276 MPa (6061-T6 typical yield) -- used for CRSS calibration
+
+csv_out = "ODF_{}_D{}_physics.csv".format(N, D)
+xlsx_out = "ODF_{}_D{}_physics.xlsx".format(N, D)
+
+# ------------ Utilities: rotations, tensors, voigt ------------
+def random_rotation_matrix(rng=None):
+    if rng is None:
+        rng = np.random.default_rng()
+    u1, u2, u3 = rng.random(), rng.random(), rng.random()
+    q1 = math.sqrt(1 - u1) * math.sin(2 * math.pi * u2)
+    q2 = math.sqrt(1 - u1) * math.cos(2 * math.pi * u2)
+    q3 = math.sqrt(u1) * math.sin(2 * math.pi * u3)
+    q4 = math.sqrt(u1) * math.cos(2 * math.pi * u3)
+    w, x, y, z = q4, q1, q2, q3
+    R = np.array([
+        [1 - 2*(y*y + z*z),     2*(x*y - z*w),     2*(x*z + y*w)],
+        [    2*(x*y + z*w), 1 - 2*(x*x + z*z),     2*(y*z - x*w)],
+        [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x*x + y*y)]
+    ])
+    return R
+
+def build_C4_cubic(C11, C12, C44):
+    C = np.zeros((3,3,3,3))
+    for i,j,k,l in itertools.product(range(3), repeat=4):
+        val = 0.0
+        if i==j==k==l:
+            val = C11
+        elif i==j and k==l and i!=k:
+            val = C12
+        elif i==k and j==l and i!=j:
+            val = C44
+        elif i==l and j==k and i!=j:
+            val = C44
+        C[i,j,k,l] = val
+    return C
+
+def rotate_C4(C, R):
+    return np.einsum('ia,jb,kc,ld,abcd->ijkl', R, R, R, R, C, optimize=True)
+
+# explicit Voigt mapping (engineering shear convention)
+voigt_pairs = [(0,0),(1,1),(2,2),(1,2),(0,2),(0,1)]  # (11,22,33,23,13,12)
+def c4_to_voigt(C4):
+    C6 = np.zeros((6,6))
+    for a,(i,j) in enumerate(voigt_pairs):
+        for b,(k,l) in enumerate(voigt_pairs):
+            val = C4[i,j,k,l]
+            # adjust for engineering shear: mapping details handled by consistent convention below
+            # We'll convert tensor form to engineering form:
+            # Multiply shear components appropriately (consistent approach)
+            C6[a,b] = val
+    # Convert to engineering Voigt convention factors:
+    # Using common practice: S(3:6, :) and S(:, 3:6) scaling when necessary is handled in inversion stage
+    # To be robust, ensure symmetry
+    return 0.5*(C6 + C6.T)
+
+# For Reuss we need compliance matrix S6; compute S6 for each node by inverting node's C6
+def invert_6x6(C6):
+    # Regularize if necessary
+    try:
+        S6 = np.linalg.inv(C6)
+    except np.linalg.LinAlgError:
+        C6_reg = C6 + np.eye(6) * 1e-8 * np.max(np.abs(C6))
+        S6 = np.linalg.inv(C6_reg)
+    return S6
+
+# Use standard 12 systems: slip directions <110> on {111} planes.
+# We will create the 12 unique (s,n) pairs in crystal coords.
+def make_fcc_12_slip_systems():
+    # define family of 4 {111} plane normals and 3 <110> directions in each plane
+    planes = [np.array([ 1,  1,  1]),
+              np.array([ 1,  1, -1]),
+              np.array([ 1, -1,  1]),
+              np.array([-1,  1,  1])]
+    # For every plane, select three <110> directions lying in that plane:
+    # manually define 12 unique pairs (common standard list)
+    dirs = [
+        np.array([ 0,  1, -1]), np.array([ 1,  0, -1]), np.array([ 1, -1,  0]),
+        np.array([ 0,  1,  1]), np.array([ 1,  0,  1]), np.array([ 1,  1,  0]),
+        np.array([ 0, -1,  1]), np.array([-1,  0,  1]), np.array([-1,  1,  0]),
+        np.array([ 0, -1, -1]), np.array([-1,  0, -1]), np.array([-1, -1,  0])
+    ]
+    # pair them with plane normals in a reasonable way (representative)
+    slip_systems = []
+    # for simplicity associate sets of 3 directions to each plane
+    for i, n in enumerate(planes):
+        for j in range(3):
+            s = dirs[i*3 + j]
+            slip_systems.append((s/np.linalg.norm(s), n/np.linalg.norm(n)))
+    return slip_systems
+
+slip_systems = make_fcc_12_slip_systems()
+
+# ------------ Build nodes: random rotations and node tensors ------------
+rng = np.random.default_rng(0)
+R_nodes = [random_rotation_matrix(rng) for _ in range(D)]
+C4_crystal = build_C4_cubic(C11, C12, C44)
+
+# Precompute node-wise C6 and S6
+C6_nodes = np.zeros((D,6,6))
+S6_nodes = np.zeros((D,6,6))
+for i,R in enumerate(R_nodes):
+    C4r = rotate_C4(C4_crystal, R)
+    C6 = c4_to_voigt(C4r)
+    # ensure symmetry
+    C6 = 0.5*(C6 + C6.T)
+    S6 = invert_6x6(C6)
+    C6_nodes[i] = C6
+    S6_nodes[i] = S6
+
+# Precompute node-wise Schmid-related factor (we compute average Schmid factor per node)
+# Loading direction in sample coords = sample z [0,0,1]. Convert to crystal coords: l_cr = R^T * l_sample
+l_sample = np.array([0.0, 0.0, 1.0])
+m_mean_nodes = np.zeros(D)
+for i,R in enumerate(R_nodes):
+    l_cr = R.T.dot(l_sample)
+    m_vals = []
+    for s_cr, n_cr in slip_systems:
+        m = abs(np.dot(s_cr, l_cr) * np.dot(n_cr, l_cr))
+        m_vals.append(m)
+    # mean Schmid factor (avoid zero)
+    m_mean = max(np.mean(m_vals), 1e-6)
+    m_mean_nodes[i] = m_mean
+
+# We'll approximate node Taylor factor M_node ~ 1 / m_mean (rough proxy)
+M_nodes = 1.0 / m_mean_nodes
+
+# Calibrate tau0 (CRSS) so mean macroscopic Y ≈ target_mean_Y for random ODFs
+# For random ODF average Y ≈ mean_x (x dot (M_nodes * tau0)) = tau0 * mean(M_nodes)*mean_x_sum(=1)
+mean_M = np.mean(M_nodes)
+tau0_calibrated = target_mean_Y / mean_M
+tau0 = tau0_calibrated
+print("Calibrated tau0 (Pa) set to:", tau0)
+
+# Node-wise sigma_i = M_node * tau0 (Pa)
+sigma_nodes = M_nodes * tau0
+
+
+# Dirichlet generator
+def gen_dirichlet(n, D, alpha, rng=None):
+    if rng is None:
+        rng = np.random.default_rng()
+    alphas = np.ones(D) * alpha
+    return rng.dirichlet(alphas, size=n)
+
+# Prepare storage and stream to disk in batches
+out_cols = [f"x{i}" for i in range(D)] + ["E_Pa", "Y_Pa", "F"]
+first_write = True
+rows_processed = 0
+
+print("Starting generation in batches...")
+rng = np.random.default_rng(42)
+while rows_processed < N:
+    nb = min(batch_size, N - rows_processed)
+    X_batch = gen_dirichlet(nb, D, alpha_dirichlet, rng=rng)  # shape (nb,D)
+
+    # Voigt combination: shape (nb,6,6)
+    # Use vectorized dot: for flattened representation
+    C6_flat_nodes = C6_nodes.reshape(D, 36)   # (D,36)
+    S6_flat_nodes = S6_nodes.reshape(D, 36)
+    Cbar_flat = X_batch.dot(C6_flat_nodes)    # (nb,36)
+    S_reuss_flat = X_batch.dot(S6_flat_nodes) # (nb,36)
+
+    E_vals = np.zeros(nb)
+    Y_vals = np.zeros(nb)
+    F_vals = np.zeros(nb)
+
+    for j in range(nb):
+        C_voigt = Cbar_flat[j].reshape(6,6)
+        S_reuss = S_reuss_flat[j].reshape(6,6)
+        # Reuss to C_reuss
+        try:
+            C_reuss = np.linalg.inv(S_reuss)
+        except np.linalg.LinAlgError:
+            # regularize
+            S_reuss_reg = S_reuss + np.eye(6)*1e-12*np.max(np.abs(S_reuss))
+            C_reuss = np.linalg.inv(S_reuss_reg)
+        C_hill = 0.5*(C_voigt + C_reuss)
+        # invert to get S_hill
+        try:
+            S_hill = np.linalg.inv(C_hill)
+        except np.linalg.LinAlgError:
+            C_hill_reg = C_hill + np.eye(6)*1e-12*np.max(np.abs(C_hill))
+            S_hill = np.linalg.inv(C_hill_reg)
+        # Young's modulus along sample z (Voigt index 2 -> epsilon_33)
+        S33 = S_hill[2,2]
+        E_val = np.nan
+        if S33 > 0:
+            E_val = 1.0 / S33
+        else:
+            E_val = np.nan
+        # Y: weighted average of node sigma_nodes
+        Y_val = X_batch[j].dot(sigma_nodes)
+        F_val = Y_val / (E_val + 1e-12)
+
+        E_vals[j] = E_val
+        Y_vals[j] = Y_val
+        F_vals[j] = F_val
+
+    # Build DataFrame and append to CSV
+    df_batch = pd.DataFrame(X_batch, columns=[f"x{i}" for i in range(D)])
+    df_batch["E_Pa"] = E_vals
+    df_batch["Y_Pa"] = Y_vals
+    df_batch["F"] = F_vals
+
+    if first_write:
+        df_batch.to_csv(csv_out, index=False, mode='w', float_format='%.6e')
+        first_write = False
+    else:
+        df_batch.to_csv(csv_out, index=False, mode='a', header=False, float_format='%.6e')
+
+    rows_processed += nb
+    print(f"Processed {rows_processed}/{N} samples...")
+
+print("All batches done. CSV saved:", csv_out)
+
+if save_excel:
+    print("Saving to Excel (may take time)...")
+    try:
+        df_all = pd.read_csv(csv_out)
+        df_all.to_excel(xlsx_out, index=False)
+        print("Excel saved:", xlsx_out)
+    except Exception as e:
+        print("Failed to write Excel:", e)
+
+if save_to_drive:
+    try:
+        from google.colab import drive
+        drive.mount('/content/drive')
+        os.makedirs(drive_folder, exist_ok=True)
+        csv_drive = os.path.join(drive_folder, csv_out)
+        xlsx_drive = os.path.join(drive_folder, xlsx_out)
+        os.replace(csv_out, csv_drive)
+        if save_excel:
+            os.replace(xlsx_out, xlsx_drive)
+        print("Moved files to Google Drive folder:", drive_folder)
+    except Exception as e:
+        print("Drive save failed:", e)
+
+print("Done. Files created (CSV and optionally XLSX).")
