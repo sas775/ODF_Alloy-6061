@@ -1,0 +1,352 @@
+# ------------------ Block 1: Upload dataset ------------------
+from google.colab import files
+import pandas as pd, io
+
+print("🔽 Please upload your dataset file (CSV or XLSX). It should include columns: x0..x63, E_Pa, Y_Pa, F (and may include label).")
+uploaded = files.upload()
+fname = list(uploaded.keys())[0]
+print("Uploaded:", fname)
+
+if fname.lower().endswith(".csv"):
+    df = pd.read_csv(io.BytesIO(uploaded[fname]))
+elif fname.lower().endswith((".xls", ".xlsx")):
+    df = pd.read_excel(io.BytesIO(uploaded[fname]))
+else:
+    raise ValueError("Unsupported file type. Please upload CSV or XLSX.")
+
+print("\nDataset loaded. Shape:", df.shape)
+display(df.head())
+
+# ------------------ Block 2: Label creation ------------------
+import numpy as np
+
+if 'label' not in df.columns:
+    # dataset already contains only top 25% and bottom 25% -> use median split
+    medianF = df['F'].median()
+    df['label'] = df['F'].apply(lambda v: 1 if v >= medianF else -1)
+    print("Label column created by median split of F.")
+else:
+    print("Label column already present; using existing labels.")
+
+print("Label counts:")
+print(df['label'].value_counts())
+
+# ------------------ Block 3: Prepare X, y and scaling ------------------
+from sklearn.preprocessing import MinMaxScaler
+
+D = 64
+feat_cols = [f"x{i}" for i in range(D)]
+# Safety check
+missing = [c for c in feat_cols if c not in df.columns]
+if missing:
+    raise ValueError("Missing feature columns: " + ", ".join(missing))
+
+X = df[feat_cols].values.copy()
+y = df['label'].values.copy()
+
+scaler = MinMaxScaler()
+Xs = scaler.fit_transform(X)
+
+print("Prepared X (shape {}) and y (shape {})".format(X.shape, y.shape))
+# ------------------ Block 4: Feature ranking (MI, F, Chi2, LinearSVC) ------------------
+from sklearn.feature_selection import mutual_info_classif, f_classif, chi2
+from sklearn.svm import LinearSVC
+import numpy as np
+
+y_bin = (y==1).astype(int)
+
+# 1) Mutual Information
+mi = mutual_info_classif(Xs, y_bin, random_state=0)
+
+# 2) F-score (ANOVA)
+f_vals, _ = f_classif(Xs, y_bin)
+f_vals = np.nan_to_num(f_vals)
+
+# 3) Chi2 (requires non-neg inputs -> Xs is in [0,1])
+chi_vals, _ = chi2(Xs, y_bin)
+
+# 4) Linear SVC weights
+svc = LinearSVC(penalty='l2', dual=False, max_iter=5000)
+svc.fit(Xs, y_bin)
+svc_w = np.abs(svc.coef_).ravel()
+
+# Convert scores to ranks (1 = best)
+def ranks_from_scores(scores):
+    order = np.argsort(-scores)
+    ranks = np.empty_like(order)
+    ranks[order] = np.arange(1, len(scores)+1)
+    return ranks
+
+r_mi = ranks_from_scores(mi)
+r_f  = ranks_from_scores(f_vals)
+r_chi= ranks_from_scores(chi_vals)
+r_svc= ranks_from_scores(svc_w)
+
+rank_sum = r_mi + r_f + r_chi + r_svc
+final_rank = np.argsort(rank_sum)  # indices sorted by combined rank (best first)
+
+topK = 20
+top_features = final_rank[:topK]
+print("Top {} features (indices):".format(topK), top_features)
+print("Rank-sum values for top features:", rank_sum[top_features])
+# ------------------ Block 5: Decision tree and rule extraction ------------------
+from sklearn.tree import DecisionTreeClassifier, _tree
+from sklearn import tree
+
+dt = DecisionTreeClassifier(max_depth=6, min_samples_leaf=50, random_state=0)
+dt.fit(Xs, y_bin)
+print("Decision tree trained. Depth:", dt.get_depth())
+
+# Optional: print textual tree (first 2000 chars)
+txt = tree.export_text(dt, feature_names=feat_cols)
+print(txt[:2000])
+
+# traverse tree to collect rules for leaves predicting class 1
+sk_tree = dt.tree_
+feature_arr = sk_tree.feature
+thresholds = sk_tree.threshold
+
+def traverse(node=0, bounds=None, rules=None):
+    if bounds is None:
+        bounds = {i:[0.0, 1.0] for i in range(D)}
+    if rules is None:
+        rules = []
+    if feature_arr[node] != _tree.TREE_UNDEFINED:
+        f = feature_arr[node]
+        thr = thresholds[node]
+        # left child
+        b_left = {k:v[:] for k,v in bounds.items()}
+        b_left[f][1] = min(b_left[f][1], thr)
+        traverse(sk_tree.children_left[node], b_left, rules)
+        # right child
+        b_right = {k:v[:] for k,v in bounds.items()}
+        b_right[f][0] = max(b_right[f][0], thr)
+        traverse(sk_tree.children_right[node], b_right, rules)
+    else:
+        # leaf: check predicted class
+        vals = sk_tree.value[node][0]
+        pred = np.argmax(vals)
+        if pred == 1:
+            rules.append(bounds)
+    return rules
+
+rules = traverse()
+print("Number of 'good' rules (leaf nodes predicting good):", len(rules))
+# ------------------ Block 6: Reduced ranges from rules ------------------
+reduced_ranges = {}
+for f in top_features:
+    lows = [r[f][0] for r in rules]
+    highs= [r[f][1] for r in rules]
+    if len(lows) == 0:
+        reduced_ranges[f] = (0.0, 1.0)
+    else:
+        low = max(0.0, min(lows))
+        high = min(1.0, max(highs))
+        # pad small amount to avoid zero-width
+        pad = 0.02 * (high - low + 1e-12)
+        reduced_ranges[f] = (max(0.0, low-pad), min(1.0, high+pad))
+
+print("Reduced ranges for top features (scaled):")
+for f in top_features:
+    print(f, ":", reduced_ranges[f])
+# ------------------ Block 7: Train RandomForest surrogate for F ------------------
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+
+X_train, X_val, y_train, y_val = train_test_split(Xs, df['F'].values, test_size=0.2, random_state=0)
+rfF = RandomForestRegressor(n_estimators=300, max_depth=20, n_jobs=-1, random_state=0)
+print("Training RF surrogate (this may take a little)...")
+rfF.fit(X_train, y_train)
+r2 = rfF.score(X_val, y_val)
+print("RF surrogate R^2 on validation:", r2)
+
+# ------------------ Block 8: Enhanced optimization (multi-start) ------------------
+import numpy as np
+
+# prepare starts from good samples
+good_idx = np.where(df['label']==1)[0]
+n_starts = 20
+if len(good_idx) >= n_starts:
+    starts_idx = np.random.choice(good_idx, size=n_starts, replace=False)
+else:
+    starts_idx = np.random.choice(len(Xs), size=n_starts, replace=False)
+starts = Xs[starts_idx]
+
+rank_order = list(final_rank[:topK])  # order of variables to update
+
+def optimize_one(start_x, rf_model, rank_order, reduced_ranges, grid_points=15):
+    x = start_x.copy()
+    best_val = rf_model.predict(x.reshape(1,-1))[0]
+    for var in rank_order:
+        low, high = reduced_ranges.get(var, (0.0,1.0))
+        grid = np.linspace(low, high, grid_points)
+        best_local = x[var]
+        best_local_val = best_val
+        for v in grid:
+            x_tmp = x.copy()
+            x_tmp[var] = v
+            val = rf_model.predict(x_tmp.reshape(1,-1))[0]
+            if val > best_local_val:
+                best_local_val = val
+                best_local = v
+        x[var] = best_local
+        best_val = best_local_val
+    return x, best_val
+
+solutions = []
+for s in starts:
+    x_opt, val = optimize_one(s, rfF, rank_order, reduced_ranges)
+    solutions.append((x_opt, val))
+
+# sort solutions by surrogate value
+solutions_sorted = sorted(solutions, key=lambda t: -t[1])
+print("Top surrogate F values (top 5):", [s[1] for s in solutions_sorted[:5]])
+# ------------------ Block 9: Map back to original ODF and evaluate via nearest neighbor ------------------
+import numpy as np
+
+def scaled_to_odf(x_scaled, scaler=scaler):
+    x_orig = scaler.inverse_transform(x_scaled.reshape(1,-1)).ravel()
+    x_orig = np.clip(x_orig, 0, None)
+    if x_orig.sum() <= 0:
+        x_orig = np.ones_like(x_orig) / len(x_orig)
+    else:
+        x_orig = x_orig / x_orig.sum()
+    return x_orig
+
+top_candidates = []
+for x_scaled, surr_val in solutions_sorted[:10]:
+    x_odf = scaled_to_odf(x_scaled)
+    # nearest neighbor in dataset (original ODF space)
+    dists = np.linalg.norm(df[feat_cols].values - x_odf, axis=1)
+    nn_idx = int(np.argmin(dists))
+    nn_row = df.iloc[nn_idx]
+    top_candidates.append({
+        'scaled': x_scaled,
+        'odf': x_odf,
+        'surrogate_F': float(surr_val),
+        'nn_index': nn_idx,
+        'nn_F': float(nn_row['F']),
+        'nn_E': float(nn_row['E_Pa']),
+        'nn_Y': float(nn_row['Y_Pa'])
+    })
+# show top candidate nearest true F
+for i,c in enumerate(top_candidates[:5]):
+    print(f"Candidate {i}: surrogate_F={c['surrogate_F']:.6e}, nearest_true_F={c['nn_F']:.6e}, nn_idx={c['nn_index']}")
+# ------------------ Block 10 (Corrected): Baselines - Random search & GA ------------------
+import numpy as np
+rng = np.random.default_rng(123)
+
+# --------- RANDOM SEARCH BASELINE (10k samples) ---------
+n_rand = 10000
+X_rand = rng.dirichlet(np.ones(D)*0.8, size=n_rand)           # random valid ODFs
+X_rand_scaled = scaler.transform(X_rand)
+F_rand_surr = rfF.predict(X_rand_scaled)
+best_rand_idx = np.argmax(F_rand_surr)
+
+print("Random baseline best surrogate F:", F_rand_surr[best_rand_idx])
+
+# nearest true F from dataset
+nn_idx_rand = int(np.argmin(np.linalg.norm(df[feat_cols].values - X_rand[best_rand_idx], axis=1)))
+print("Random best nearest true F:", df.iloc[nn_idx_rand]['F'])
+
+
+# --------- GENETIC ALGORITHM (PyGAD >= 2.20.0) ---------
+!pip install --quiet pygad
+import pygad
+
+# Gene space for only the top features
+gene_space = []
+for var in rank_order:
+    low, high = reduced_ranges.get(var, (0.0,1.0))
+    gene_space.append({'low': low, 'high': high})
+
+# --------- GA FITNESS FUNCTION (must accept 3 arguments) ---------
+def ga_fitness(ga_instance, solution, solution_idx):
+    # start from median microstructure
+    x_scaled = np.median(Xs, axis=0).copy()
+
+    # apply GA genes to the selected variables
+    for i, var in enumerate(rank_order):
+        x_scaled[var] = solution[i]
+
+    # surrogate model prediction
+    fitness = rfF.predict(x_scaled.reshape(1, -1))[0]
+    return fitness    # maximize F
+
+# --------- RUN GA ---------
+ga_instance = pygad.GA(
+    num_generations=30,
+    num_parents_mating=8,
+    fitness_func=ga_fitness,     # fixed
+    sol_per_pop=24,
+    num_genes=len(rank_order),
+    gene_space=gene_space,
+    mutation_percent_genes=10,
+    random_seed=0
+)
+
+print("Running GA optimization...")
+ga_instance.run()
+
+best_sol, best_fitness, best_idx = ga_instance.best_solution()
+print("GA best surrogate F:", best_fitness)
+
+# --------- Convert GA solution back to scaled → original ODF → nearest true ---------
+x_scaled_opt = np.median(Xs, axis=0).copy()
+for i, var in enumerate(rank_order):
+    x_scaled_opt[var] = best_sol[i]
+
+# back to ODF
+x_opt_odf = scaler.inverse_transform(x_scaled_opt.reshape(1,-1)).ravel()
+x_opt_odf = np.clip(x_opt_odf, 0, None)
+x_opt_odf = x_opt_odf / x_opt_odf.sum()
+
+# nearest dataset sample (true physics)
+dist = np.linalg.norm(df[feat_cols].values - x_opt_odf, axis=1)
+nn_idx_ga = int(np.argmin(dist))
+
+print("GA best nearest true F:", df.iloc[nn_idx_ga]['F'])
+print("GA best nearest true E:", df.iloc[nn_idx_ga]['E_Pa'])
+print("GA best nearest true Y:", df.iloc[nn_idx_ga]['Y_Pa'])
+# ------------------ Block 12: Interpretability (RF importances + SHAP) ------------------
+import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
+
+# RF importances
+importances = rfF.feature_importances_
+top_imp_idx = np.argsort(-importances)[:20]
+plt.figure(figsize=(6,6))
+sns.barplot(x=importances[top_imp_idx], y=[f"x{i}" for i in top_imp_idx])
+plt.title("Top 20 RF importances")
+plt.show()
+
+# SHAP (subset)
+explainer = shap.TreeExplainer(rfF)
+sample = X_val[:2000]
+shap_values = explainer.shap_values(sample)
+shap.summary_plot(shap_values, sample, feature_names=feat_cols, max_display=20)
+# ------------------ Block 13: Save outputs ------------------
+import joblib, json
+
+# save RF surrogate
+joblib.dump(rfF, "rfF_surrogate.joblib")
+# save top candidates & reduced_ranges
+summary = {
+    "top_features": top_features.tolist(),
+    "reduced_ranges": {int(k): tuple(v) for k,v in reduced_ranges.items()},
+    "top_candidates": [{
+        "surrogate_F": float(c['surrogate_F']),
+        "nn_index": int(c['nn_index']),
+        "nn_F": float(c['nn_F'])
+    } for c in top_candidates]
+}
+with open("analysis_summary.json","w") as f:
+    json.dump(summary, f, indent=2)
+
+# offer download
+from google.colab import files
+files.download("rfF_surrogate.joblib")
+files.download("analysis_summary.json")
+print("Saved and offered download for surrogate and summary.")
+
