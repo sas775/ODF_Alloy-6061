@@ -8,17 +8,17 @@ import itertools
 import math
 import os
 
-# ------------ User parameters (edit if needed) ------------
-N = 150000            # total ODF samples to generate (set smaller to test)
+# ------------ User parameters
+N = 150000            # total ODF samples to generate 
 D = 64                # number of discrete orientation nodes
 alpha_dirichlet = 0.8 # Dirichlet concentration (>=0.1; lower => sparser)
-batch_size = 3000     # number of samples processed per batch (tune by RAM)
-save_excel = True     # save .xlsx (can be slow for very large N)
-save_to_drive = False # set True to save to Google Drive (requires mount)
-drive_folder = "/content/drive/MyDrive/ODF_dataset"  # if drive saving enabled
+batch_size = 3000     # number of samples processed per batch
+save_excel = True     
+save_to_drive = False 
+drive_folder = "/content/drive/MyDrive/ODF_dataset" 
 
 # Material constants (Aluminum single-crystal, approximate)
-# Source: typical FCC aluminium single-crystal constants (Pa)
+
 C11 = 106e9
 C12 = 60e9
 C44 = 28e9
@@ -71,13 +71,8 @@ def c4_to_voigt(C4):
     for a,(i,j) in enumerate(voigt_pairs):
         for b,(k,l) in enumerate(voigt_pairs):
             val = C4[i,j,k,l]
-            # adjust for engineering shear: mapping details handled by consistent convention below
-            # We'll convert tensor form to engineering form:
-            # Multiply shear components appropriately (consistent approach)
             C6[a,b] = val
     # Convert to engineering Voigt convention factors:
-    # Using common practice: S(3:6, :) and S(:, 3:6) scaling when necessary is handled in inversion stage
-    # To be robust, ensure symmetry
     return 0.5*(C6 + C6.T)
 
 # For Reuss we need compliance matrix S6; compute S6 for each node by inverting node's C6
@@ -169,7 +164,6 @@ def gen_dirichlet(n, D, alpha, rng=None):
     alphas = np.ones(D) * alpha
     return rng.dirichlet(alphas, size=n)
 
-# Prepare storage and stream to disk in batches
 out_cols = [f"x{i}" for i in range(D)] + ["E_Pa", "Y_Pa", "F"]
 first_write = True
 rows_processed = 0
