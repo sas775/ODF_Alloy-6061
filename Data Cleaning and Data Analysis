@@ -308,6 +308,27 @@ nn_idx_ga = int(np.argmin(dist))
 print("GA best nearest true F:", df.iloc[nn_idx_ga]['F'])
 print("GA best nearest true E:", df.iloc[nn_idx_ga]['E_Pa'])
 print("GA best nearest true Y:", df.iloc[nn_idx_ga]['Y_Pa'])
+# ------------------ Block 11: Clustering distinct optima ------------------
+from sklearn.cluster import DBSCAN
+from sklearn.metrics import pairwise_distances
+
+# gather candidates: top surrogate solutions + random best + GA best
+cand_list = []
+for s in solutions_sorted[:30]:
+    cand_list.append(s[0])
+cand_list.append(X_rand_scaled[best_rand_idx])
+cand_list.append(x_scaled)  # GA best scaled
+cand_arr = np.array(cand_list)
+# convert to original ODF space
+cand_odfs = np.array([scaled_to_odf(c) for c in cand_arr])
+
+# clustering with cosine distance
+dist = pairwise_distances(cand_odfs, metric='cosine')
+cl = DBSCAN(eps=0.02, min_samples=2, metric='precomputed')
+labels = cl.fit_predict(dist)
+print("Cluster labels for candidates:", labels)
+n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+print("Number of clusters (distinct families):", n_clusters)
 # ------------------ Block 12: Interpretability (RF importances + SHAP) ------------------
 import matplotlib.pyplot as plt
 import seaborn as sns
